@@ -6,6 +6,8 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const app = express();
 
+const START_TIME = Date.now();
+
 // --- 1. CORS & ORIGIN WHITELIST ---
 // List of allowed origins. If empty, all origins are accepted.
 const ALLOWED_ORIGINS = [];
@@ -23,7 +25,6 @@ app.use(cors({
 app.use(express.json());
 
 // --- 2. RATE LIMITER ---
-// Configurable via env vars, sensible defaults out of the box.
 // RATE_LIMIT_WINDOW_MS: window in milliseconds (default: 1 minute)
 // RATE_LIMIT_MAX:       max requests per window per IP (default: 30)
 const limiter = rateLimit({
@@ -41,7 +42,6 @@ const PORT = process.env.PORT || 10000;
 // --- 3. KEY POOLS ---
 // Multiple keys per provider separated by "|" in the env var.
 // e.g. GEMINI_KEY=key1|key2|key3
-// At startup, each is split into an array and tried in order on failure.
 const KEY_POOLS = {};
 ['GEMINI', 'GROQ', 'MISTRAL', 'CEREBRAS'].forEach(provider => {
     const raw = process.env[`${provider}_KEY`] || '';
@@ -73,6 +73,9 @@ function difficultyToIndex(difficulty) {
 // --- 5. UTILS ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Timeout for each provider call in milliseconds (default: 15s)
+const PROVIDER_TIMEOUT_MS = parseInt(process.env.PROVIDER_TIMEOUT_MS) || 15000;
+
 // Timing-safe secret comparison to prevent timing attacks
 function checkSecret(provided) {
     const expected = process.env.MY_APP_SECRET || '';
@@ -83,7 +86,7 @@ function checkSecret(provided) {
     );
 }
 
-// --- 6. PROVIDER CALL (with key rotation) ---
+// --- 6. PROVIDER CALL (with key rotation + timeout) ---
 async function callAIProvider(index, prompt) {
     const { provider, model } = MODELS[index];
     const keys = KEY_POOLS[provider.toUpperCase()];
@@ -113,7 +116,7 @@ If the request is too difficult for your current tier (${index + 1} of ${MODELS.
   "package": "climb"
 }
 
-Task context:  Ensure your package matches the user's requested data structure.
+Task context: Ensure your package matches the user's requested data structure.
 `;
 
         if (provider === 'gemini') {
@@ -136,7 +139,10 @@ Task context:  Ensure your package matches the user's requested data structure.
         }
 
         try {
-            const response = await axios.post(url, data, { headers });
+            const response = await axios.post(url, data, {
+                headers,
+                timeout: PROVIDER_TIMEOUT_MS
+            });
 
             let raw;
             if (provider === 'gemini') {
@@ -151,11 +157,10 @@ Task context:  Ensure your package matches the user's requested data structure.
             return JSON.parse(raw);
 
         } catch (err) {
-            const status = err.response ? err.response.status : 'No Response';
+            const status = err.response ? err.response.status : (err.code === 'ECONNABORTED' ? 'Timeout' : 'No Response');
             console.warn(`[Key Fail] ${provider}:${model} key slot ${ki + 1}/${keys.length} — Status: ${status}`);
             lastError = err;
 
-            // Only rotate keys on rate limit or auth errors, fail fast on others
             if (status !== 429 && status !== 401 && status !== 403) break;
         }
     }
@@ -202,10 +207,10 @@ async function executeFullSweep(difficulty, userPrompt) {
             }
 
             console.log(`[Success] Answered by index ${currentIndex} (${provider}:${model})`);
-            return result.package;
+            return { package: result.package, answeredBy: { index: currentIndex, provider, model } };
 
         } catch (err) {
-            const status = err.response ? err.response.status : "No Response";
+            const status = err.response ? err.response.status : (err.code === 'ECONNABORTED' ? 'Timeout' : 'No Response');
             console.error(`[Failure] index ${currentIndex} (${provider}:${model}) — Status: ${status} (all keys exhausted)`);
 
             if (status === 503 || status === 429) {
@@ -224,6 +229,25 @@ async function executeFullSweep(difficulty, userPrompt) {
 // --- 8. APP ROUTES ---
 app.get('/wake', (req, res) => res.status(200).send("Full Sweep Online"));
 
+app.get('/health', (req, res) => {
+    const uptimeMs = Date.now() - START_TIME;
+    const uptimeSeconds = Math.floor(uptimeMs / 1000);
+
+    res.json({
+        status: "ok",
+        uptime: `${Math.floor(uptimeSeconds / 3600)}h ${Math.floor((uptimeSeconds % 3600) / 60)}m ${uptimeSeconds % 60}s`,
+        models: MODELS.length,
+        keyPools: Object.fromEntries(
+            Object.entries(KEY_POOLS).map(([provider, keys]) => [provider, keys.length])
+        ),
+        rateLimit: {
+            max: parseInt(process.env.RATE_LIMIT_MAX) || 30,
+            windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60000
+        },
+        providerTimeoutMs: PROVIDER_TIMEOUT_MS
+    });
+});
+
 app.post('/ask-ai', async (req, res) => {
     const { secret, difficulty, prompt } = req.body;
     if (!secret || !checkSecret(secret)) return res.status(403).send("Forbidden");
@@ -231,7 +255,11 @@ app.post('/ask-ai', async (req, res) => {
     const result = await executeFullSweep(difficulty, prompt);
 
     if (result) {
-        res.json({ state: "complete", package: { package: result } });
+        res.json({
+            state: "complete",
+            package: { package: result.package },
+            answeredBy: result.answeredBy
+        });
     } else {
         res.status(503).json({ state: "error", content: "All models exhausted" });
     }
@@ -243,6 +271,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
         console.log(`[Keys] ${provider}: ${keys.length} key(s) loaded`);
     });
     console.log(`[Rate Limit] ${parseInt(process.env.RATE_LIMIT_MAX) || 30} requests / ${(parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60000) / 1000}s per IP`);
+    console.log(`[Timeout] ${PROVIDER_TIMEOUT_MS}ms per provider call`);
 });
 
 server.keepAliveTimeout = 125000;
