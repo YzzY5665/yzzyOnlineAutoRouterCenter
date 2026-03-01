@@ -2,25 +2,26 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const cors = require('cors');
 const app = express();
+
+// --- 1. CORS & ORIGIN WHITELIST ---
+// List of allowed origins. If empty, all origins are accepted.
+const ALLOWED_ORIGINS = [];
+
+app.use(cors({
+    origin: (origin, callback) => {
+        if (ALLOWED_ORIGINS.length === 0) return callback(null, true);
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        callback(new Error('Origin not allowed'));
+    },
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type']
+}));
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-
-// --- 1. ORIGIN WHITELIST ---
-// List of allowed origins. If empty, all origins are accepted.
-const ALLOWED_ORIGINS = [
-];
-
-function checkOrigin(req, res) {
-    if (ALLOWED_ORIGINS.length === 0) return true;
-    const origin = req.headers['origin'];
-    if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
-        res.status(403).json({ state: "error", content: "Origin not allowed" });
-        return false;
-    }
-    return true;
-}
 
 // --- 2. MODEL ARRAY ---
 // Ordered from least to most capable (difficulty 0.0 → 1.0).
@@ -128,11 +129,10 @@ async function executeFullSweep(difficulty, userPrompt) {
             if (up < total && !visited.has(up))   return up;
             if (down >= 0  && !visited.has(down)) return down;
         }
-        return null; // all visited
+        return null;
     }
 
     while (visited.size < total) {
-        // If already visited, find the next unvisited one
         if (visited.has(currentIndex)) {
             const next = nextUnvisited(currentIndex);
             if (next === null) break;
@@ -148,7 +148,6 @@ async function executeFullSweep(difficulty, userPrompt) {
 
             if (result.state === "too_complex") {
                 console.log(`[Upward] ${provider}:${model} says too complex, climbing...`);
-                // Prefer climbing toward most capable end
                 const next = nextUnvisited(currentIndex);
                 if (next === null) break;
                 currentIndex = next > currentIndex ? next : total - 1;
@@ -167,7 +166,6 @@ async function executeFullSweep(difficulty, userPrompt) {
                 await sleep(1500);
             }
 
-            // Fall back toward least capable end on error
             currentIndex = Math.max(currentIndex - 1, 0);
         }
     }
@@ -180,8 +178,6 @@ async function executeFullSweep(difficulty, userPrompt) {
 app.get('/wake', (req, res) => res.status(200).send("Full Sweep Online"));
 
 app.post('/ask-ai', async (req, res) => {
-    if (!checkOrigin(req, res)) return;
-
     const { secret, difficulty, prompt } = req.body;
     if (!secret || !checkSecret(secret)) return res.status(403).send("Forbidden");
 
