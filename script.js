@@ -10,7 +10,7 @@ const START_TIME = Date.now();
 
 // --- 1. CORS & ORIGIN WHITELIST ---
 // List of allowed origins. If empty, all origins are accepted.
-const ALLOWED_ORIGINS = [];
+const ALLOWED_ORIGINS = ['https://cascade.yzzy.online'];
 
 app.use(cors({
     origin: (origin, callback) => {
