@@ -23,7 +23,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// --- 2. MODEL ARRAY ---
+// --- 2. KEY POOLS ---
+// Multiple keys per provider separated by "-" in the env var.
+// e.g. GEMINI_KEY=key1-key2-key3
+// At startup, each is split into an array and tried in order on failure.
+const KEY_POOLS = {};
+['GEMINI', 'GROQ', 'MISTRAL', 'CEREBRAS'].forEach(provider => {
+    const raw = process.env[`${provider}_KEY`] || '';
+    KEY_POOLS[provider] = raw.split('|').map(k => k.trim()).filter(Boolean);
+});
+
+// --- 3. MODEL ARRAY ---
 // Ordered from least to most capable (difficulty 0.0 → 1.0).
 // Add, remove, or reorder freely — the cascade adapts automatically.
 const MODELS = [
@@ -33,7 +43,7 @@ const MODELS = [
     { provider: 'gemini',   model: 'gemini-2.0-flash' },       // 0.33 — gemini fast
     { provider: 'groq',     model: 'llama-3.3-70b-specdec' },  // 0.44 — groq speculative
     { provider: 'mistral',  model: 'mistral-small-latest' },   // 0.56 — mistral small
-    { provider: 'groq',     model: 'llama-3.3-70b-versatile' },// 0.67 — groq again as fallback
+    { provider: 'groq',     model: 'llama-3.3-70b-versatile' },// 0.67 — groq fallback
     { provider: 'mistral',  model: 'mistral-large-latest' },   // 0.78 — mistral large
     { provider: 'gemini',   model: 'gemini-2.5-flash' },       // 0.89 — gemini 2.5 thinking
     { provider: 'gemini',   model: 'gemini-2.5-pro' },         // 1.00 — most capable
@@ -45,7 +55,7 @@ function difficultyToIndex(difficulty) {
     return Math.round(clamped * (MODELS.length - 1));
 }
 
-// --- 3. UTILS ---
+// --- 4. UTILS ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Timing-safe secret comparison to prevent timing attacks
@@ -58,12 +68,23 @@ function checkSecret(provided) {
     );
 }
 
-// --- 4. PROVIDER CALL ---
+// --- 5. PROVIDER CALL (with key rotation) ---
 async function callAIProvider(index, prompt) {
     const { provider, model } = MODELS[index];
-    let url, data, headers = { "Content-Type": "application/json" };
+    const keys = KEY_POOLS[provider.toUpperCase()];
 
-    const systemPreface = `
+    if (!keys || keys.length === 0) {
+        throw new Error(`No API keys configured for provider: ${provider}`);
+    }
+
+    let lastError;
+
+    // Try each key in order until one works
+    for (let ki = 0; ki < keys.length; ki++) {
+        const key = keys[ki];
+        let url, data, headers = { "Content-Type": "application/json" };
+
+        const systemPreface = `
 [PROTOCOL: JSON-ONLY]
 You are a specialized AI node. You must respond ONLY with a valid JSON object.
 The output MUST follow this schema:
@@ -81,40 +102,54 @@ If the request is too difficult for your current tier (${index + 1} of ${MODELS.
 Task context: The word 'json' is required for validation. Ensure your package matches the user's requested data structure.
 `;
 
-    if (provider === 'gemini') {
-        url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_KEY}`;
-        data = {
-            contents: [{ parts: [{ text: `${systemPreface}\n\nTask: ${prompt}` }] }],
-            generationConfig: { responseMimeType: "application/json" }
-        };
-    } else {
-        if (provider === 'groq')          url = "https://api.groq.com/openai/v1/chat/completions";
-        else if (provider === 'mistral')  url = "https://api.mistral.ai/v1/chat/completions";
-        else if (provider === 'cerebras') url = "https://api.cerebras.ai/v1/chat/completions";
+        if (provider === 'gemini') {
+            url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+            data = {
+                contents: [{ parts: [{ text: `${systemPreface}\n\nTask: ${prompt}` }] }],
+                generationConfig: { responseMimeType: "application/json" }
+            };
+        } else {
+            if (provider === 'groq')          url = "https://api.groq.com/openai/v1/chat/completions";
+            else if (provider === 'mistral')  url = "https://api.mistral.ai/v1/chat/completions";
+            else if (provider === 'cerebras') url = "https://api.cerebras.ai/v1/chat/completions";
 
-        headers["Authorization"] = `Bearer ${process.env[`${provider.toUpperCase()}_KEY`]}`;
-        data = {
-            model,
-            messages: [{ role: "user", content: `${systemPreface}\n\nTask: ${prompt}` }],
-            response_format: { type: "json_object" }
-        };
+            headers["Authorization"] = `Bearer ${key}`;
+            data = {
+                model,
+                messages: [{ role: "user", content: `${systemPreface}\n\nTask: ${prompt}` }],
+                response_format: { type: "json_object" }
+            };
+        }
+
+        try {
+            const response = await axios.post(url, data, { headers });
+
+            let raw;
+            if (provider === 'gemini') {
+                raw = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
+            } else {
+                raw = response.data.choices?.[0]?.message?.content;
+            }
+
+            if (!raw) throw new Error(`Empty response from index ${index} key ${ki}`);
+
+            console.log(`[Key] ${provider} used key slot ${ki + 1}/${keys.length}`);
+            return JSON.parse(raw);
+
+        } catch (err) {
+            const status = err.response ? err.response.status : 'No Response';
+            console.warn(`[Key Fail] ${provider}:${model} key slot ${ki + 1}/${keys.length} — Status: ${status}`);
+            lastError = err;
+
+            // Only rotate keys on rate limit or auth errors, fail fast on others
+            if (status !== 429 && status !== 401 && status !== 403) break;
+        }
     }
 
-    const response = await axios.post(url, data, { headers });
-
-    let raw;
-    if (provider === 'gemini') {
-        raw = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    } else {
-        raw = response.data.choices?.[0]?.message?.content;
-    }
-
-    if (!raw) throw new Error(`Empty response from index ${index}`);
-
-    return JSON.parse(raw);
+    throw lastError;
 }
 
-// --- 5. FULL SWEEP CASCADE ENGINE ---
+// --- 6. FULL SWEEP CASCADE ENGINE ---
 async function executeFullSweep(difficulty, userPrompt) {
     let currentIndex = difficultyToIndex(difficulty);
     const visited = new Set();
@@ -159,7 +194,7 @@ async function executeFullSweep(difficulty, userPrompt) {
 
         } catch (err) {
             const status = err.response ? err.response.status : "No Response";
-            console.error(`[Failure] index ${currentIndex} (${provider}:${model}) — Status: ${status}`);
+            console.error(`[Failure] index ${currentIndex} (${provider}:${model}) — Status: ${status} (all keys exhausted)`);
 
             if (status === 503 || status === 429) {
                 console.log("⚠️ Rate limit or busy. Cooling down 1.5s...");
@@ -174,7 +209,7 @@ async function executeFullSweep(difficulty, userPrompt) {
     return null;
 }
 
-// --- 6. APP ROUTES ---
+// --- 7. APP ROUTES ---
 app.get('/wake', (req, res) => res.status(200).send("Full Sweep Online"));
 
 app.post('/ask-ai', async (req, res) => {
@@ -192,6 +227,10 @@ app.post('/ask-ai', async (req, res) => {
 
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Middleware listening on port ${PORT} at 0.0.0.0`);
+    // Log key pool sizes at startup for easy verification
+    Object.entries(KEY_POOLS).forEach(([provider, keys]) => {
+        console.log(`[Keys] ${provider}: ${keys.length} key(s) loaded`);
+    });
 });
 
 server.keepAliveTimeout = 125000;
