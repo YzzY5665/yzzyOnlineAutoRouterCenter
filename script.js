@@ -1,3 +1,8 @@
+//------------------------------------------------------------------
+// Cascade v1.1.0
+// Ai middleware with multi-provider cascade, key rotation, and rate limiting.
+//------------------------------------------------------------------
+
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -10,7 +15,9 @@ const START_TIME = Date.now();
 
 // --- 1. CORS & ORIGIN WHITELIST ---
 // List of allowed origins. If empty, all origins are accepted.
-const ALLOWED_ORIGINS = ['https://cascade.yzzy.online'];
+const ALLOWED_ORIGINS = [
+    'https://cascade.yzzy.online'
+];
 
 app.use(cors({
     origin: (origin, callback) => {
@@ -51,6 +58,8 @@ const KEY_POOLS = {};
 // --- 4. MODEL ARRAY ---
 // Ordered from least to most capable (difficulty 0.0 → 1.0).
 // Add, remove, or reorder freely — the cascade adapts automatically.
+// If a model's provider has no API key configured, it will be skipped at
+// runtime and treated as a failure — the cascade moves on automatically.
 const MODELS = [
     { provider: 'cerebras', model: 'llama3.1-8b' },            // 0.00 — fastest, lightest
     { provider: 'groq',     model: 'llama-3.3-70b-versatile' },// 0.11 — fast, reliable
@@ -60,11 +69,12 @@ const MODELS = [
     { provider: 'mistral',  model: 'mistral-small-latest' },   // 0.56 — mistral small
     { provider: 'groq',     model: 'llama-3.3-70b-versatile' },// 0.67 — groq fallback
     { provider: 'mistral',  model: 'mistral-large-latest' },   // 0.78 — mistral large
-    { provider: 'gemini',   model: 'gemini-2.5-flash' },       // 0.89 — gemini 2.5 thinking
+    { provider: 'gemini',   model: 'gemini-2.5-flash' },       // 0.89 — gemini 2.5 flash
     { provider: 'gemini',   model: 'gemini-2.5-pro' },         // 1.00 — most capable
 ];
 
 // Converts a 0.0–1.0 float to the nearest index in MODELS.
+// Values outside 0.0–1.0 are silently clamped.
 function difficultyToIndex(difficulty) {
     const clamped = Math.min(Math.max(parseFloat(difficulty) || 0, 0.0), 1.0);
     return Math.round(clamped * (MODELS.length - 1));
@@ -174,19 +184,28 @@ async function executeFullSweep(difficulty, userPrompt) {
     const visited = new Set();
     const total = MODELS.length;
 
-    function nextUnvisited(from) {
-        for (let step = 1; step < total; step++) {
-            const up   = from + step;
-            const down = from - step;
-            if (up < total && !visited.has(up))   return up;
-            if (down >= 0  && !visited.has(down)) return down;
+    // On error: go down. If nothing unvisited below, go up instead.
+    function nextOnError(from) {
+        for (let i = from - 1; i >= 0; i--) {
+            if (!visited.has(i)) return i;
+        }
+        for (let i = from + 1; i < total; i++) {
+            if (!visited.has(i)) return i;
+        }
+        return null;
+    }
+
+    // On too_complex: go up by 1. If nothing unvisited above, give up.
+    function nextOnTooComplex(from) {
+        for (let i = from + 1; i < total; i++) {
+            if (!visited.has(i)) return i;
         }
         return null;
     }
 
     while (visited.size < total) {
         if (visited.has(currentIndex)) {
-            const next = nextUnvisited(currentIndex);
+            const next = nextOnError(currentIndex);
             if (next === null) break;
             currentIndex = next;
         }
@@ -200,9 +219,12 @@ async function executeFullSweep(difficulty, userPrompt) {
 
             if (result.state === "too_complex") {
                 console.log(`[Upward] ${provider}:${model} says too complex, climbing...`);
-                const next = nextUnvisited(currentIndex);
-                if (next === null) break;
-                currentIndex = next > currentIndex ? next : total - 1;
+                const next = nextOnTooComplex(currentIndex);
+                if (next === null) {
+                    console.error(`[Exhausted] too_complex at highest model — no more to climb.`);
+                    break;
+                }
+                currentIndex = next;
                 continue;
             }
 
@@ -218,7 +240,9 @@ async function executeFullSweep(difficulty, userPrompt) {
                 await sleep(1500);
             }
 
-            currentIndex = Math.max(currentIndex - 1, 0);
+            const next = nextOnError(currentIndex);
+            if (next === null) break;
+            currentIndex = next;
         }
     }
 
@@ -257,7 +281,7 @@ app.post('/ask-ai', async (req, res) => {
     if (result) {
         res.json({
             state: "complete",
-            package: { package: result.package },
+            package: result.package,
             answeredBy: result.answeredBy
         });
     } else {
