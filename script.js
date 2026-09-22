@@ -1,5 +1,5 @@
 //------------------------------------------------------------------
-// Cascade v1.1.0
+// Cascade v1.3.0
 // Ai middleware with multi-provider cascade, key rotation, and rate limiting.
 //------------------------------------------------------------------
 
@@ -13,16 +13,26 @@ const app = express();
 
 const START_TIME = Date.now();
 
-// --- 1. CORS & ORIGIN WHITELIST ---
-// List of allowed origins. If empty, all origins are accepted.
-const ALLOWED_ORIGINS = [
-    // 'https://cascade.yzzy.online'
+// --- 1. CORS & TRUSTED ORIGIN WHITELIST ---
+// Origins in this list are allowed to call /ask-ai from a browser WITHOUT the
+// x-api-key secret (e.g. the public demo page). Every other caller — no Origin
+// header (curl, server-to-server, scripts) or a non-matching Origin — still
+// needs the secret. If empty, CORS accepts all origins but the secret is
+// always required.
+//
+// NOTE: an Origin header is client-supplied and trivially spoofable outside a
+// browser (e.g. `curl -H "Origin: https://cascade.yzzy.online"`), so this is
+// NOT real access control — it only keeps casual/browser-based reuse out.
+// Only rely on this if you're fine with these origins' traffic being
+// effectively unauthenticated.
+const PUBLIC_ORIGINS = [
+    'https://cascade.yzzy.online'
 ];
 
 app.use(cors({
     origin: (origin, callback) => {
-        if (ALLOWED_ORIGINS.length === 0) return callback(null, true);
-        if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        if (PUBLIC_ORIGINS.length === 0) return callback(null, true);
+        if (!origin || PUBLIC_ORIGINS.includes(origin)) return callback(null, true);
         callback(new Error('Origin not allowed'));
     },
     methods: ['GET', 'POST'],
@@ -281,8 +291,13 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/ask-ai', async (req, res) => {
-    const secret = req.header('x-api-key');
-    if (!secret || !checkSecret(secret)) return res.status(403).send("Forbidden");
+    const origin = req.header('origin');
+    const isPublicOrigin = PUBLIC_ORIGINS.length > 0 && origin && PUBLIC_ORIGINS.includes(origin);
+
+    if (!isPublicOrigin) {
+        const secret = req.header('x-api-key');
+        if (!secret || !checkSecret(secret)) return res.status(403).send("Forbidden");
+    }
 
     const { difficulty, prompt } = req.body;
 
