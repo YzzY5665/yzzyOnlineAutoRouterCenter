@@ -78,17 +78,44 @@ const KEY_POOLS = {};
 // Add, remove, or reorder freely — the cascade adapts automatically.
 // If a model's provider has no API key configured, it will be skipped at
 // runtime and treated as a failure — the cascade moves on automatically.
+// Only models VERIFIED to answer with the keys this service actually holds.
+// Measured from production logs on 2026-09-22 with the previous 10-entry list:
+//
+//   index 0  cerebras llama3.1-8b .............. 404
+//   index 1  groq     llama-3.3-70b-versatile .. 404
+//   index 2  cerebras llama-3.3-70b ............ 404
+//   index 3  gemini   gemini-2.0-flash ......... 404
+//   index 4  groq     llama-3.3-70b-specdec .... 400  (retired by Groq)
+//   index 5  mistral  mistral-small-latest ..... 429  (key valid, rate limited)
+//   index 6  groq     llama-3.3-70b-versatile .. 404
+//   index 7  mistral  mistral-large-latest ..... 403  (key lacks access)
+//   index 8  gemini   gemini-2.5-flash ......... 200  <- the only reliable one
+//   index 9  gemini   gemini-2.5-pro ........... 404
+//
+// Nine dead entries were not merely useless, they were actively harmful:
+// nextOnError() walks DOWNWARD, so a single transient 503 on index 8 dragged
+// the request through all nine corpses (plus 1.5 s cooldowns) and returned
+// "All models exhausted" — roughly 18 s to fail a request that succeeded
+// immediately on retry.
+//
+// Keeping only working entries means a failure now lands on a NEIGHBOUR THAT
+// ALSO WORKS, which fixes the long-failure problem without touching the
+// cascade logic itself.
+//
+// TO RE-ADD A PROVIDER: confirm the model id against that provider before
+// putting it back, e.g.
+//   curl -s https://api.groq.com/openai/v1/models      -H "Authorization: Bearer $GROQ_KEY"
+//   curl -s https://api.cerebras.ai/v1/models          -H "Authorization: Bearer $CEREBRAS_KEY"
+//   curl -s https://api.mistral.ai/v1/models           -H "Authorization: Bearer $MISTRAL_KEY"
+//   curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_KEY"
+// Model ids drift as providers retire versions; an unverified id is a 404 that
+// costs every caller a full sweep.
 const MODELS = [
-    { provider: 'cerebras', model: 'llama3.1-8b' },            // 0.00 — fastest, lightest
-    { provider: 'groq',     model: 'llama-3.3-70b-versatile' },// 0.11 — fast, reliable
-    { provider: 'cerebras', model: 'llama-3.3-70b' },          // 0.22 — cerebras 70b
-    { provider: 'gemini',   model: 'gemini-2.0-flash' },       // 0.33 — gemini fast
-    { provider: 'groq',     model: 'llama-3.3-70b-specdec' },  // 0.44 — groq speculative
-    { provider: 'mistral',  model: 'mistral-small-latest' },   // 0.56 — mistral small
-    { provider: 'groq',     model: 'llama-3.3-70b-versatile' },// 0.67 — groq fallback
-    { provider: 'mistral',  model: 'mistral-large-latest' },   // 0.78 — mistral large
-    { provider: 'gemini',   model: 'gemini-2.5-flash' },       // 0.89 — gemini 2.5 flash
-    { provider: 'gemini',   model: 'gemini-2.5-pro' },         // 1.00 — most capable
+    { provider: 'mistral',  model: 'mistral-small-latest' },   // 0.00 — cheap; 429s under load
+    { provider: 'mistral',  model: 'mistral-small-latest' },   // 0.25 — second bite at mistral
+    { provider: 'gemini',   model: 'gemini-2.5-flash' },       // 0.50 — verified working
+    { provider: 'gemini',   model: 'gemini-2.5-flash' },       // 0.75 — verified working
+    { provider: 'gemini',   model: 'gemini-2.5-flash' },       // 1.00 — verified working
 ];
 
 // Converts a 0.0–1.0 float to the nearest index in MODELS.
