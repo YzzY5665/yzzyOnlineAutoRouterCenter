@@ -3,6 +3,7 @@
   "version": "1.0.3",
   "description": "AI router that is the middle man for yzzyOnline products to use ai services",
   "main": "script.js",
+  "license": "MIT",
   "scripts": {
     "start": "node script.js"
   },

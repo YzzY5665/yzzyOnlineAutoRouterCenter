@@ -26,10 +26,18 @@ app.use(cors({
         callback(new Error('Origin not allowed'));
     },
     methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type']
+    allowedHeaders: ['Content-Type', 'x-api-key']
 }));
 
 app.use(express.json());
+
+// Reject malformed JSON bodies cleanly instead of crashing the request.
+app.use((err, req, res, next) => {
+    if (err instanceof SyntaxError && 'body' in err) {
+        return res.status(400).json({ state: "error", content: "Invalid JSON body" });
+    }
+    next(err);
+});
 
 // --- 2. RATE LIMITER ---
 // RATE_LIMIT_WINDOW_MS: window in milliseconds (default: 1 minute)
@@ -273,19 +281,26 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/ask-ai', async (req, res) => {
-    const { secret, difficulty, prompt } = req.body;
+    const secret = req.header('x-api-key');
     if (!secret || !checkSecret(secret)) return res.status(403).send("Forbidden");
 
-    const result = await executeFullSweep(difficulty, prompt);
+    const { difficulty, prompt } = req.body;
 
-    if (result) {
-        res.json({
-            state: "complete",
-            package: result.package,
-            answeredBy: result.answeredBy
-        });
-    } else {
-        res.status(503).json({ state: "error", content: "All models exhausted" });
+    try {
+        const result = await executeFullSweep(difficulty, prompt);
+
+        if (result) {
+            res.json({
+                state: "complete",
+                package: result.package,
+                answeredBy: result.answeredBy
+            });
+        } else {
+            res.status(503).json({ state: "error", content: "All models exhausted" });
+        }
+    } catch (err) {
+        console.error(`[Unhandled] /ask-ai failed: ${err.message}`);
+        res.status(500).json({ state: "error", content: "Internal error" });
     }
 });
 
